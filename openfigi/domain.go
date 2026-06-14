@@ -2,7 +2,8 @@ package openfigi
 
 import (
 	"context"
-	"net/url"
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
@@ -15,61 +16,62 @@ import (
 //	import _ "github.com/tamnd/openfigi-cli/openfigi"
 //
 // exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// openfigi:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone openfigi binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
+// "github.com/lib/pq"`. The init below registers it; the host then
+// dereferences openfigi:// URIs by routing to the operations Register installs.
+// The same Domain also builds the standalone openfigi binary (see cli.NewApp),
+// so the binary and a host share one source of truth.
 func init() { kit.Register(Domain{}) }
 
 // Domain is the openfigi driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme, the hostnames a pasted link is matched against,
+// and the identity reused for the binary's help and version.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
 		Scheme: "openfigi",
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "openfigi",
-			Short:  "A command line for openfigi.",
-			Long: `A command line for openfigi.
+			Short:  "A command line for the OpenFIGI financial instrument identifier API.",
+			Long: `A command line for the OpenFIGI financial instrument identifier API.
 
-openfigi reads public openfigi data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+openfigi maps identifiers (TICKER, ISIN, CUSIP, SEDOL, FIGI) to Bloomberg
+FIGI codes and searches the OpenFIGI database. No API key required for
+basic use; a key unlocks higher rate limits.`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/openfigi-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `openfigi page` and
-	// `ant get openfigi://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// map: resolve an identifier to FIGI records.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "map",
+		Group:   "read",
+		List:    true,
+		Summary: "Map an identifier to FIGI records",
+		URIType: "instrument",
+		Args:    []kit.Arg{{Name: "value", Help: "identifier value (e.g. AAPL, US4592001014)"}},
+	}, mapOp)
 
-	// List op: members of a page, the home of `openfigi links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// openfigi://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// search: search for instruments by query string.
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "read",
+		List:    true,
+		Summary: "Search for financial instruments",
+		URIType: "instrument",
+		Args:    []kit.Arg{{Name: "query", Help: "free-text search query"}},
+	}, searchOp)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the Client from the host-resolved kit.Config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
 	c := NewClient()
 	if cfg.UserAgent != "" {
@@ -88,86 +90,95 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Client *Client `kit:"inject"`
+type mapInput struct {
+	Value    string  `kit:"arg" help:"identifier value (e.g. AAPL, US4592001014)"`
+	Type     string  `kit:"flag" help:"identifier type (TICKER, ID_ISIN, ID_CUSIP, ID_SEDOL, ID_FIGI, ID_COMPOSITE_FIGI)" name:"type"`
+	Exchange string  `kit:"flag" help:"exchange code filter (e.g. US, LN)" name:"exchange"`
+	Client   *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type searchInput struct {
+	Query    string  `kit:"arg" help:"free-text search query"`
+	Exchange string  `kit:"flag" help:"exchange code filter (e.g. US, LN)" name:"exchange"`
+	Limit    int     `kit:"flag,inherit" help:"max results"`
+	Client   *Client `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func mapOp(ctx context.Context, in mapInput, emit func(*Instrument) error) error {
+	idType := in.Type
+	if idType == "" {
+		idType = "TICKER"
+	}
+	instruments, err := in.Client.Map(ctx, idType, in.Value, in.Exchange)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for i := range instruments {
+		if err := emit(&instruments[i]); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full openfigi.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized openfigi reference: %q", input)
+func searchOp(ctx context.Context, in searchInput, emit func(*Instrument) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
 	}
-	return "page", id, nil
+	instruments, err := in.Client.Search(ctx, in.Query, in.Exchange, limit)
+	if err != nil {
+		return mapErr(err)
+	}
+	for i := range instruments {
+		if err := emit(&instruments[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// --- Resolver: pure string functions, no network ---
+
+// isinRE matches a 12-character ISIN-like string: 2 letters + 9 alphanumerics + 1 digit.
+var isinRE = regexp.MustCompile(`^[A-Z]{2}[A-Z0-9]{9}[0-9]$`)
+
+// Classify turns any accepted input into (uriType, id).
+//   - Starts with "BBG" -> ("figi", input)
+//   - Matches ISIN pattern -> ("isin", input)
+//   - Else -> ("query", input)
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty OpenFIGI reference")
+	}
+	upper := strings.ToUpper(input)
+	switch {
+	case strings.HasPrefix(upper, "BBG"):
+		return "figi", input, nil
+	case isinRE.MatchString(upper):
+		return "isin", input, nil
+	default:
+		return "query", input, nil
+	}
+}
+
+// Locate returns the live https URL for a (uriType, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "figi":
+		return fmt.Sprintf("https://www.openfigi.com/id/%s", id), nil
+	case "isin", "query":
+		return fmt.Sprintf("https://www.openfigi.com/search#!?q=%s", id), nil
+	default:
 		return "", errs.Usage("openfigi has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// mapErr converts a library error into the appropriate kit error.
 func mapErr(err error) error {
 	return err
 }
