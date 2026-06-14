@@ -1,38 +1,52 @@
 // Package openfigi is the library behind the openfigi command line:
-// the HTTP client, request shaping, and the typed data models for openfigi.
+// the HTTP client, request shaping, and the typed data models for the
+// OpenFIGI financial instrument identifier API.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// The Client paces requests so a busy session stays inside the unauthenticated
+// rate limit (25 req/min), retries transient failures (429, 5xx), and exposes
+// two methods that cover the two live endpoints: Map and Search.
 package openfigi
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to openfigi. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to OpenFIGI.
 const DefaultUserAgent = "openfigi/dev (+https://github.com/tamnd/openfigi-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at openfigi.com; change it once you
-// know the real endpoints you want to read.
+// Host is the site this client's domain driver claims.
 const Host = "openfigi.com"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// Config holds tunable Client parameters.
+type Config struct {
+	BaseURL string
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
+}
 
-// Client talks to openfigi over HTTP.
+// DefaultConfig returns conservative defaults for unauthenticated access.
+// The unauthenticated rate limit is 25 req/min, so we pace at 1s per request.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL: "https://api.openfigi.com",
+		Rate:    1 * time.Second,
+		Retries: 3,
+		Timeout: 15 * time.Second,
+	}
+}
+
+// Client talks to the OpenFIGI API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,21 +54,128 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with the default config applied.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Instrument is the output record for both Map and Search operations.
+type Instrument struct {
+	FIGI          string `kit:"id" json:"figi"`
+	Name          string `json:"name"`
+	Ticker        string `json:"ticker"`
+	ExchCode      string `json:"exch_code"`
+	SecurityType  string `json:"security_type"`
+	MarketSector  string `json:"market_sector"`
+	CompositeFIGI string `json:"composite_figi"`
+}
+
+// wire types match the OpenFIGI JSON response exactly (camelCase keys).
+type wireInstrument struct {
+	FIGI          string `json:"figi"`
+	Name          string `json:"name"`
+	Ticker        string `json:"ticker"`
+	ExchCode      string `json:"exchCode"`
+	SecurityType  string `json:"securityType"`
+	MarketSector  string `json:"marketSector"`
+	CompositeFIGI string `json:"compositeFIGI"`
+}
+
+func (w wireInstrument) toInstrument() Instrument {
+	return Instrument{
+		FIGI:          w.FIGI,
+		Name:          w.Name,
+		Ticker:        w.Ticker,
+		ExchCode:      w.ExchCode,
+		SecurityType:  w.SecurityType,
+		MarketSector:  w.MarketSector,
+		CompositeFIGI: w.CompositeFIGI,
+	}
+}
+
+type mappingRequest struct {
+	IDType   string `json:"idType"`
+	IDValue  string `json:"idValue"`
+	ExchCode string `json:"exchCode,omitempty"`
+}
+
+type searchRequest struct {
+	Query    string `json:"query"`
+	ExchCode string `json:"exchCode,omitempty"`
+}
+
+// Map maps an identifier to FIGI records using POST /v3/mapping.
+func (c *Client) Map(ctx context.Context, idType, idValue, exchCode string) ([]Instrument, error) {
+	req := []mappingRequest{{IDType: idType, IDValue: idValue, ExchCode: exchCode}}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	respBody, err := c.post(ctx, c.BaseURL+"/v3/mapping", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var wireResp []struct {
+		Data    []wireInstrument `json:"data"`
+		Warning string           `json:"warning"`
+	}
+	if err := json.Unmarshal(respBody, &wireResp); err != nil {
+		return nil, fmt.Errorf("map: decode response: %w", err)
+	}
+
+	var out []Instrument
+	for _, entry := range wireResp {
+		for _, w := range entry.Data {
+			out = append(out, w.toInstrument())
+		}
+	}
+	return out, nil
+}
+
+// Search searches for instruments using POST /v3/search.
+// The limit is applied client-side after the API returns its page of results.
+func (c *Client) Search(ctx context.Context, query, exchCode string, limit int) ([]Instrument, error) {
+	req := searchRequest{Query: query, ExchCode: exchCode}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	respBody, err := c.post(ctx, c.BaseURL+"/v3/search", body)
+	if err != nil {
+		return nil, err
+	}
+
+	var wireResp struct {
+		Data []wireInstrument `json:"data"`
+	}
+	if err := json.Unmarshal(respBody, &wireResp); err != nil {
+		return nil, fmt.Errorf("search: decode response: %w", err)
+	}
+
+	data := wireResp.Data
+	if limit > 0 && len(data) > limit {
+		data = data[:limit]
+	}
+
+	out := make([]Instrument, 0, len(data))
+	for _, w := range data {
+		out = append(out, w.toInstrument())
+	}
+	return out, nil
+}
+
+// post sends a JSON POST request and returns the response body, with pacing and retries.
+func (c *Client) post(ctx context.Context, url string, body []byte) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,25 +185,26 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		resp, retry, err := c.doPost(ctx, url, body)
 		if err == nil {
-			return body, nil
+			return resp, nil
 		}
 		lastErr = err
 		if !retry {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("post %s: %w", url, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) doPost(ctx context.Context, url string, body []byte) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -94,7 +216,8 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
+		b, _ := io.ReadAll(resp.Body)
+		return nil, false, fmt.Errorf("http %d: %s", resp.StatusCode, string(b))
 	}
 
 	b, err := io.ReadAll(resp.Body)
@@ -121,80 +244,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on openfigi.com. It is a stand-in for the typed records you
-// will model from the real openfigi endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `openfigi cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
